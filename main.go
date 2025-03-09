@@ -131,40 +131,30 @@ func injectPayload(originalURL string, payloads []string, injectionType, attack,
 				}
 			}
 		}
+		// Substitua a seção do case "finder" na função injectPayload
 	case "finder":
-		// Se não houver parâmetros, forçamos o uso dos parâmetros hardcoded.
-		if len(params) == 0 {
-			parts := strings.SplitN(originalURL, "?", 2)
-			originalURL = parts[0] + finderQuery
-			pairs := strings.Split(strings.TrimPrefix(finderQuery, "?"), "&")
-			for _, pair := range pairs {
-				if strings.Contains(pair, "=") {
-					kv := strings.SplitN(pair, "=", 2)
-					params[kv[0]] = kv[1]
-				} else {
-					params[pair] = ""
-				}
+		// Em vez de processar cada payload separadamente, tratamos o modo finder
+		// como um único request clusterbomb com os parâmetros predefinidos
+		finderParams := parseFinderParams()
+
+		// Construir a URL base com os parâmetros hardcoded
+		paramsCopy := make(map[string]string)
+		for _, param := range finderParams {
+			if attack == "replace" {
+				paramsCopy[param] = payloads[0] // Usamos apenas o primeiro payload como exemplo
+			} else {
+				paramsCopy[param] = param + payloads[0]
 			}
 		}
-		// Para cada payload, injeta em todos os parâmetros de uma só vez.
-		for _, payload := range payloads {
-			paramsCopy := make(map[string]string)
-			for k, v := range params {
-				if attack == "replace" {
-					paramsCopy[k] = payload
-				} else {
-					paramsCopy[k] = v + payload
-				}
+
+		fullURL := baseURL + "?" + buildQueryString(paramsCopy)
+		if mode == "xss" {
+			if verbose {
+				fmt.Printf("%s URL: %s | Payload: %s\n", getInjectionLabel(injectionType), fullyEncodeURL(fullURL), payloads[0])
 			}
-			fullURL := baseURL + "?" + buildQueryString(paramsCopy)
-			if mode == "xss" {
-				if verbose {
-					fmt.Printf("%s URL: %s | Payload: %s\n", getInjectionLabel(injectionType), fullyEncodeURL(baseURL), payload)
-				}
-				confirmXSS(fullURL, payload, injectionType, "")
-			} else if mode == "sqli" {
-				confirmSQLi(fullURL, verbose)
-			}
+			confirmXSS(fullURL, payloads[0], injectionType, "")
+		} else if mode == "sqli" {
+			confirmSQLi(fullURL, verbose)
 		}
 	case "param":
 		// Para cada parâmetro, injeta cada payload.
@@ -320,20 +310,64 @@ func confirmSQLi(urlStr string, verbose bool) {
 	}
 }
 
-// testURL processa a injeção utilizando os payloads e respeita o número de threads.
+// Modifique a função testURL para tratar o modo finder de forma especial
 func testURL(urlStr string, payloads []string, injectionType, attack, mode string, verbose bool, threads int) {
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, threads)
-	for _, payload := range payloads {
-		wg.Add(1)
-		sem <- struct{}{}
-		go func(pl string) {
-			defer wg.Done()
-			injectPayload(urlStr, []string{pl}, injectionType, attack, mode, verbose)
-			<-sem
-		}(payload)
+	if injectionType == "finder" {
+		// Para o modo finder, fazemos apenas uma chamada por payload
+		// em vez de criar várias goroutines
+		parts := strings.SplitN(urlStr, "?", 2)
+		baseURL := parts[0]
+
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, threads)
+
+		for _, payload := range payloads {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(pl string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				// Obter parâmetros do finder
+				finderParams := parseFinderParams()
+
+				// Criar mapa de parâmetros com o payload
+				paramsCopy := make(map[string]string)
+				for _, param := range finderParams {
+					if attack == "replace" {
+						paramsCopy[param] = pl
+					} else {
+						paramsCopy[param] = param + pl
+					}
+				}
+
+				fullURL := baseURL + "?" + buildQueryString(paramsCopy)
+				if mode == "xss" {
+					if verbose {
+						fmt.Printf("%s URL: %s | Payload: %s\n", getInjectionLabel(injectionType), fullyEncodeURL(fullURL), pl)
+					}
+					confirmXSS(fullURL, pl, injectionType, "")
+				} else if mode == "sqli" {
+					confirmSQLi(fullURL, verbose)
+				}
+			}(payload)
+		}
+		wg.Wait()
+	} else {
+		// Comportamento original para os outros modos
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, threads)
+		for _, payload := range payloads {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(pl string) {
+				defer wg.Done()
+				injectPayload(urlStr, []string{pl}, injectionType, attack, mode, verbose)
+				<-sem
+			}(payload)
+		}
+		wg.Wait()
 	}
-	wg.Wait()
 }
 
 // newCustomTestURL injeta todos os parâmetros customizados simultaneamente (clusterbomb).
@@ -378,9 +412,7 @@ func singleCustomTestURL(urlStr, param, payload, mode string, verbose bool) {
 	}
 }
 
-// processCustomPayloadURLs injeta os payloads customizados nos parâmetros especificados.
-// Se não estiver no modo "clusterbomb", agrupa os parâmetros em chunks conforme a flag -cs (chunk size).
-// No modo finder, os parâmetros são obtidos da finderQuery.
+// Na função processCustomPayloadURLs, modifique o tratamento para o modo finder:
 func processCustomPayloadURLs(urls []string, paramStr string, payloads []string, mode string, injectionType string, verbose bool, threads int, chunkSize int) {
 	var paramList []string
 	if injectionType == "finder" {
@@ -391,39 +423,46 @@ func processCustomPayloadURLs(urls []string, paramStr string, payloads []string,
 			paramList[i] = strings.TrimSpace(p)
 		}
 	}
-	var chunks [][]string
-	if chunkSize > 0 && len(paramList) > chunkSize {
-		chunks = chunkSlice(paramList, chunkSize)
-	} else {
-		chunks = [][]string{paramList}
-	}
 
 	// Semáforo para controlar o número de goroutines ativas
 	sem := make(chan struct{}, threads)
 	var wg sync.WaitGroup
 
 	for _, urlStr := range urls {
-		u := urlStr
-		if injectionType == "finder" {
-			parts := strings.SplitN(u, "?", 2)
-			u = parts[0] + finderQuery
-		}
 		for _, payload := range payloads {
-			for _, chunk := range chunks {
-				wg.Add(1)
-				sem <- struct{}{}
-				go func(u string, paramsChunk []string, p string) {
-					defer wg.Done()
-					defer func() { <-sem }()
-					// No modo finder, injetamos todos os parâmetros de uma vez.
-					if injectionType == "finder" {
-						newCustomTestURL(u, paramsChunk, p, mode, verbose)
-					} else {
-						// Nos demais modos, injetamos o grupo de parâmetros como uma única string.
-						singleCustomTestURL(u, strings.Join(paramsChunk, ","), p, mode, verbose)
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(u string, p string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				if injectionType == "finder" {
+					// No modo finder, extraímos a base da URL
+					parts := strings.SplitN(u, "?", 2)
+					baseURL := parts[0]
+
+					// Construímos uma nova URL com todos os parâmetros do finder
+					paramsMap := make(map[string]string)
+					for _, param := range paramList {
+						paramsMap[param] = p // Aplicamos o mesmo payload a todos os parâmetros
 					}
-				}(u, chunk, payload)
-			}
+
+					newURL := baseURL + "?" + buildQueryString(paramsMap)
+					if verbose {
+						fmt.Printf("Finder URL: %s\n", fullyEncodeURL(newURL))
+					}
+
+					if mode == "xss" {
+						confirmXSS(newURL, p, "finder", "")
+					} else if mode == "sqli" {
+						confirmSQLi(newURL, verbose)
+					}
+				} else {
+					// Se não for finder, continuamos com o comportamento anterior
+					// que injeta o payload nos parâmetros específicos
+					newCustomTestURL(u, paramList, p, mode, verbose)
+				}
+			}(urlStr, payload)
 		}
 	}
 	wg.Wait()

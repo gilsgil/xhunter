@@ -199,7 +199,12 @@ func confirmXSS(urlStr, payload, injectionType, injectedParam string) {
 	defer service.Stop()
 
 	caps := selenium.Capabilities{"browserName": "chrome"}
-	chromeCaps := []string{"--headless", "--ignore-certificate-errors"}
+	chromeCaps := []string{
+		"--headless",
+		"--no-sandbox",
+		"--disable-dev-shm-usage",
+		"--ignore-certificate-errors",
+	}
 	caps["goog:chromeOptions"] = map[string]interface{}{"args": chromeCaps}
 
 	wd, err := selenium.NewRemote(caps, fmt.Sprintf("http://localhost:%d/wd/hub", port))

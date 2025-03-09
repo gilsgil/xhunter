@@ -23,6 +23,9 @@ import (
 // Constante usada para o modo "finder" (parâmetros hardcoded)
 const finderQuery = "?total=total&log=log&pwd=pwd&redirect_to=redirect_to&embedded_submission_form_uuid=embedded_submission_form_uuid&limit=limit&sort=sort&type=type&sig=sig&version=version&slug=slug&user_id=user_id&countID=countID&perPage=perPage&city_id=city_id&a=a&b=b&c=c&d=d&e=e&f=f&g=g&h=h&i=i&j=j&k=k&l=l&m=m&n=n&o=o&p=p&t=t&v=v&w=w&x=x&y=y&z=z&region=region&country=country&last_id=last_id&_id=_id&cat=cat&item=item&readPdf=readPdf&file=file&uri=uri&token=token&r=r&redir=redir&redirect=redirect&destino=destino&origem=origem&src=src&source=source&destination=destination&dst=dst&dest=dest&index=index&imei=imei&msisdn=msisdn&phone=phone&number=number&num=num&numero=numero&targetEmail=targetEmail&target=target&img=img&image=image&message=message&pageID=pageID&page=page&campaign=campaign&campaignID=campaignID&status=status&report=report&mail=mail&email=email&list=list&select[list]=select[list]&select=select&otp=otp&ProductID=ProductID&id=id&username=username&password=password&uname=uname&pass=pass&username=username&location=location&url=url&u=u&p=p&name=name&search=search&product=product&filter=filter&query=query&q=q&searchForm=searchForm&test=test&goButton=goButton&text=text&tfUname=tfUPass&tfUPass=tfUPass&data=data&user=user&pass=pass&post=post&pid=pid&u=u&s=s&path=path&PHPSESSID=PHPSESSID&lang=lang&language=language&note=note"
 
+// Semáforo global para controlar o número de instâncias Chrome
+var globalChromeSem chan struct{}
+
 // getFreePort retorna uma porta TCP livre no localhost.
 func getFreePort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -217,6 +220,10 @@ func injectPayload(originalURL string, payloads []string, injectionType, attack,
 // confirmXSS utiliza o Selenium para carregar a URL e verifica se há alerta.
 // Se injectedParam não for vazio, exibe também o payload e, se não for finder, o parâmetro.
 func confirmXSS(urlStr, payload, injectionType, injectedParam string) {
+	// Adquire um slot do semáforo global antes de iniciar o Chrome
+	globalChromeSem <- struct{}{}
+	defer func() { <-globalChromeSem }()
+
 	port, err := getFreePort()
 	if err != nil {
 		log.Printf("Erro ao obter porta livre: %v", err)
@@ -268,7 +275,7 @@ func confirmXSS(urlStr, payload, injectionType, injectedParam string) {
 // confirmSQLi realiza requisições GET e POST para detectar SQLi baseado em tempo.
 func confirmSQLi(urlStr string, verbose bool) {
 	client := &http.Client{
-		Timeout: 30 * time.Second, // Timeout aumentado para 60 segundos
+		Timeout: 30 * time.Second, // Timeout aumentado para 30 segundos
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
@@ -390,8 +397,11 @@ func processCustomPayloadURLs(urls []string, paramStr string, payloads []string,
 	} else {
 		chunks = [][]string{paramList}
 	}
-	var wg sync.WaitGroup
+
+	// Semáforo para controlar o número de goroutines ativas
 	sem := make(chan struct{}, threads)
+	var wg sync.WaitGroup
+
 	for _, urlStr := range urls {
 		u := urlStr
 		if injectionType == "finder" {
@@ -404,6 +414,7 @@ func processCustomPayloadURLs(urls []string, paramStr string, payloads []string,
 				sem <- struct{}{}
 				go func(u string, paramsChunk []string, p string) {
 					defer wg.Done()
+					defer func() { <-sem }()
 					// No modo finder, injetamos todos os parâmetros de uma vez.
 					if injectionType == "finder" {
 						newCustomTestURL(u, paramsChunk, p, mode, verbose)
@@ -411,7 +422,6 @@ func processCustomPayloadURLs(urls []string, paramStr string, payloads []string,
 						// Nos demais modos, injetamos o grupo de parâmetros como uma única string.
 						singleCustomTestURL(u, strings.Join(paramsChunk, ","), p, mode, verbose)
 					}
-					<-sem
 				}(u, chunk, payload)
 			}
 		}
@@ -458,11 +468,17 @@ func processURLs(filePath, wordlist, injectionType, attack, mode string, verbose
 		log.Fatalf("Erro ao ler wordlist: %v", err)
 	}
 	payloads := strings.Split(string(data), "\n")
+
+	// Semáforo para controlar o número de goroutines ativas
+	sem := make(chan struct{}, threads)
 	var wg sync.WaitGroup
+
 	for _, urlStr := range urls {
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(u string) {
 			defer wg.Done()
+			defer func() { <-sem }()
 			testURL(u, payloads, injectionType, attack, mode, verbose, threads)
 		}(urlStr)
 	}
@@ -490,6 +506,10 @@ func main() {
 		log.SetOutput(ioutil.Discard)
 	}
 
+	// Inicializa o semáforo global para controlar o número de instâncias Chrome
+	// Use o valor de threads para limitar o número de instâncias Chrome simultâneas
+	globalChromeSem = make(chan struct{}, *threads)
+
 	// Se -payload for fornecido sem -param, o payload será injetado nos parâmetros já existentes da URL.
 	if *customPayload != "" && *customParam == "" {
 		payloadList := []string{*customPayload}
@@ -514,11 +534,17 @@ func main() {
 			if err := scanner.Err(); err != nil {
 				log.Fatalf("Erro ao ler o arquivo: %v", err)
 			}
+
+			// Semáforo para controlar o número de goroutines ativas
+			sem := make(chan struct{}, *threads)
 			var wg sync.WaitGroup
+
 			for _, u := range urls {
 				wg.Add(1)
+				sem <- struct{}{}
 				go func(urlStr string) {
 					defer wg.Done()
+					defer func() { <-sem }()
 					testURL(urlStr, payloadList, *injectionType, *attack, *mode, *verbose, *threads)
 				}(u)
 			}
@@ -536,11 +562,17 @@ func main() {
 		if err := scanner.Err(); err != nil {
 			log.Fatalf("Erro ao ler da entrada padrão: %v", err)
 		}
+
+		// Semáforo para controlar o número de goroutines ativas
+		sem := make(chan struct{}, *threads)
 		var wg sync.WaitGroup
+
 		for _, u := range urls {
 			wg.Add(1)
+			sem <- struct{}{}
 			go func(urlStr string) {
 				defer wg.Done()
+				defer func() { <-sem }()
 				testURL(urlStr, payloadList, *injectionType, *attack, *mode, *verbose, *threads)
 			}(u)
 		}
@@ -634,11 +666,17 @@ func main() {
 			log.Fatalf("Erro ao ler wordlist: %v", err)
 		}
 		payloads := strings.Split(string(data), "\n")
+
+		// Semáforo para controlar o número de goroutines ativas
+		sem := make(chan struct{}, *threads)
 		var wg sync.WaitGroup
+
 		for _, urlStr := range urls {
 			wg.Add(1)
+			sem <- struct{}{}
 			go func(u string) {
 				defer wg.Done()
+				defer func() { <-sem }()
 				testURL(u, payloads, *injectionType, *attack, *mode, *verbose, *threads)
 			}(urlStr)
 		}
